@@ -4,10 +4,10 @@ import config from './config.js';
 export class CookieJar {
   constructor() {
     this.cookies = new Map();
+    this.csrfToken = null;
   }
 
   setCookieString(raw) {
-    // Parse set-cookie header
     if (!raw) return;
     const parts = raw.split(';');
     const nameValue = parts[0].trim().split('=');
@@ -21,18 +21,49 @@ export class CookieJar {
     return pairs.join('; ') || undefined;
   }
 
+  getCsrfToken() {
+    // Django usually stores CSRF in 'csrftoken' cookie
+    return this.csrfToken || this.cookies.get('csrftoken') || null;
+  }
+
   async setResponseCookies(response) {
-    const setCookie = response.headers.get('set-cookie');
-    if (setCookie) {
-      // Could be multiple cookies
-      const cookies = setCookie.split(/,\s*(?=\w+=)/);
-      cookies.forEach(c => {
-        const parts = c.split(';');
-        const nameValue = parts[0].trim().split('=');
-        if (nameValue.length >= 2) {
-          this.cookies.set(nameValue[0], nameValue.slice(1).join('='));
+    // Use getSetCookies() if available (Node.js 20+), otherwise fallback parsing
+    let cookieHeaders = [];
+    if (typeof response.headers.getSetCookies === 'function') {
+      cookieHeaders = response.headers.getSetCookies();
+      cookieHeaders.forEach(c => {
+        if (c && c.name) {
+          this.cookies.set(c.name, c.value);
+          if (c.name.toLowerCase() === 'csrftoken') {
+            this.csrfToken = c.value;
+          }
         }
       });
+    } else {
+      const setCookie = response.headers.get('set-cookie');
+      if (setCookie) {
+        // Parse multiple Set-Cookie headers properly
+        const cookieLines = setCookie.split('\n');
+        cookieLines.forEach(line => this._parseLine(line));
+        // Fallback: split by comma only for cookie boundaries
+        const parts = setCookie.split(/(?=^[\w\-]+=)/m);
+        parts.forEach(p => this._parseLine(p));
+      }
+    }
+  }
+
+  _parseLine(line) {
+    if (!line) return;
+    const trimmed = line.trim();
+    const idx = trimmed.indexOf('=');
+    if (idx > 0) {
+      const name = trimmed.slice(0, idx).trim();
+      const valEnd = trimmed.indexOf(';');
+      const value = (valEnd > idx ? trimmed.slice(idx + 1, valEnd) : trimmed.slice(idx + 1)).trim();
+      this.cookies.set(name, value);
+      if (name.toLowerCase() === 'csrftoken') {
+        this.csrfToken = value;
+      }
     }
   }
 }

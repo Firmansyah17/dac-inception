@@ -64,6 +64,11 @@ async function runSingleCycle(account, opts = {}) {
   const jar = new CookieJar();
   const bot = new DACBot(account, jar);
 
+  // Fetch cookies + CSRF token BEFORE any POST
+  try {
+    await bot.api.fetchCookies();
+  } catch {}
+
   // Attempt wallet login
   const loggedIn = await tryWalletLogin(bot.api, account);
   if (!loggedIn) {
