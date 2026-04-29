@@ -75,6 +75,11 @@ export class InceptionAPI {
     this.base = config.INCEPTION_BASE;
   }
 
+  async fetchCookies() {
+    // Hit /api/csrf/ to receive csrftoken cookie
+    return this.request('GET', '/api/csrf/');
+  }
+
   async request(method, endpoint, body, extraHeaders = {}) {
     const url = `${this.base}${endpoint}`;
     const headers = {
@@ -88,6 +93,14 @@ export class InceptionAPI {
     const cookieHeader = this.jar.getCookieHeader();
     if (cookieHeader) {
       headers['Cookie'] = cookieHeader;
+    }
+
+    // Inject CSRF token for state-changing methods
+    if (['POST', 'PUT', 'PATCH', 'DELETE'].includes(method)) {
+      const token = this.jar.getCsrfToken();
+      if (token && !headers['X-CSRFToken']) {
+        headers['X-CSRFToken'] = token;
+      }
     }
 
     const opts = {
@@ -112,7 +125,9 @@ export class InceptionAPI {
     if (ct.includes('application/json')) {
       return response.json();
     }
-    return response.text();
+    // Drain body so connection is freed
+    await response.text().catch(() => '');
+    return null;
   }
 
   get(endpoint) { return this.request('GET', endpoint); }
