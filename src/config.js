@@ -1,0 +1,28 @@
+export default {
+  INCEPTION_BASE: 'https://inception.dachain.io',
+  RPC_URL: 'https://rpctest.dachain.tech',
+  EXPLORE_URL: 'https://exptest.dachain.tech',
+  CHAIN_ID: '0x5586',
+  CHAIN_ID_DECIMAL: 21894,
+  FAUCET_INTERVAL_MS: 24 * 60 * 60 * 1000,
+  DEFAULT_CRATE_COUNT: 5,
+  // Auth endpoints (cookie-based session)
+  API_AUTH_WALLET: '/api/auth/wallet/',
+  API_AUTH_EMAIL: '/api/auth/email-link/',
+  // Inception API endpoints
+  API_SYNC: '/api/inception/sync/',
+  API_PROFILE: '/api/inception/profile/',
+  API_TASK: '/api/inception/task/',
+  API_BADGE_CLAIM: '/api/inception/claim-badge/',
+  API_FAUCET: '/api/inception/faucet/',
+  API_FAUCET_STATUS: '/api/inception/faucet/status/',
+  API_FAUCET_HISTORY: '/api/inception/faucet-history/',
+  API_CRATE_OPEN: '/api/inception/crate/open/',
+  API_CRATE_HISTORY: '/api/inception/crate/history/',
+  API_EXCHANGE_BURN: '/api/inception/exchange/confirm-burn/',
+  API_EXCHANGE_STAKE: '/api/inception/exchange/confirm-stake/',
+  API_EXCHANGE_HISTORY: '/api/inception/exchange/history/',
+  API_EXCHANGE_RECOVER: '/api/inception/exchange/recover-burns/',
+  API_QE_HISTORY: '/api/inception/qe-history/',
+  API_LEADERBOARD: '/api/inception/leaderboard/?limit=200',
+};

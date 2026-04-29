@@ -1,0 +1,23 @@
+{
+  "accounts": {
+    "1": {
+      "address": null,
+      "lastFaucet": null,
+      "lastCrate": null,
+      "lastBurn": null,
+      "lastStake": null,
+      "totalRuns": 0,
+      "totalErrors": 0
+    },
+    "2": {
+      "address": null,
+      "lastFaucet": null,
+      "lastCrate": null,
+      "lastBurn": null,
+      "lastStake": null,
+      "totalRuns": 0,
+      "totalErrors": 0
+    }
+  },
+  "lastScheduledRun": null
+}
