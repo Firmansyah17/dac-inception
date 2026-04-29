@@ -7,7 +7,7 @@ export class Account {
     // Derive address from private key if not provided
     try {
       const wallet = new ethers.Wallet(privateKey);
-      this.address = (address || wallet.address).toLowerCase();
+      this.address = address || wallet.address;
       this.wallet = wallet;
     } catch (err) {
       throw new Error(`Account ${id}: invalid private key — ${err.message}`);

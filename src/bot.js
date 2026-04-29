@@ -1,3 +1,4 @@
+import { ethers } from 'ethers';
 import { Account } from './wallet.js';
 import { CookieJar, InceptionAPI } from './api.js';
 import config from './config.js';
@@ -13,6 +14,13 @@ const logger = {
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 const randomDelay = (min = 2000, max = 5000) =>
   sleep(Math.floor(Math.random() * (max - min)) + min);
+
+// DACC contract on-chain info (from RPC inspection)
+const DACC_CONTRACT = '0x3691a78be270db1f3b1a86177a8f23f89a8cef24';
+const BURN_SELECTOR  = '0x4a5d094b';
+const STAKE_SELECTOR = '0x3a4b66f1';
+const TX_VALUE       = '0.1';
+const MIN_BALANCE    = '0.12';
 
 export class DACBot {
   constructor(account, cookieJar) {
@@ -84,7 +92,7 @@ export class DACBot {
       return result;
     } catch (err) {
       logger.warn(this.id, `Sync failed: ${err.message}`);
-      throw err;
+      return null;
     }
   }
 
@@ -92,7 +100,7 @@ export class DACBot {
     try {
       logger.info(this.id, `Requesting faucet for ${this.account.address}...`);
       const status = await this.api.faucetStatus(this.account.address);
-      
+
       // Check if faucet is available
       if (status && status.status === 'available') {
         const result = await this.api.faucet(this.account.address);
@@ -104,8 +112,12 @@ export class DACBot {
         return status;
       }
     } catch (err) {
-      logger.error(this.id, `Faucet failed: ${err.message}`);
-      this.state.errors++;
+      if (err.message.includes('already') || err.message.includes('cooldown') || err.message.includes('available')) {
+        logger.info(this.id, `Faucet on cooldown — skipping`);
+      } else {
+        logger.error(this.id, `Faucet failed: ${err.message}`);
+        this.state.errors++;
+      }
       return null;
     }
   }
@@ -118,17 +130,36 @@ export class DACBot {
       this.state.lastCrate = Date.now();
       return result;
     } catch (err) {
-      logger.error(this.id, `Open crate failed: ${err.message}`);
-      this.state.errors++;
+      if (err.message.includes('daily limit') || err.message.includes('Maximum') || err.message.includes('already')) {
+        logger.info(this.id, `Crates daily limit reached (${count}/${count}) — skip`);
+      } else {
+        logger.error(this.id, `Open crate failed: ${err.message}`);
+        this.state.errors++;
+      }
       return null;
     }
   }
 
-  async doBurn(amount = '0') {
+  async doBurn(amount = '0.1') {
     try {
-      logger.info(this.id, `Burning DACC → QE (amount: ${amount})...`);
-      const result = await this.api.confirmBurn({ amount });
-      logger.success(this.id, `Burn confirmed: ${JSON.stringify(result).slice(0, 200)}`);
+      logger.info(this.id, `Burning DACC → QE...`);
+      const provider = new ethers.JsonRpcProvider(config.RPC_URL);
+      const signer = this.account.wallet.connect(provider);
+      // Balance check
+      const balance = await provider.getBalance(this.account.address);
+      if (balance < ethers.parseEther(MIN_BALANCE)) {
+        logger.warn(this.id, `Burn skipped: low balance ${ethers.formatEther(balance)} DACC`);
+        return null;
+      }
+      const tx = await signer.sendTransaction({
+        to: DACC_CONTRACT,
+        data: BURN_SELECTOR,
+        value: ethers.parseEther(TX_VALUE),
+      });
+      logger.info(this.id, `Burn tx: ${tx.hash}`);
+      await tx.wait();
+      const result = await this.api.confirmBurn({ tx_hash: tx.hash });
+      logger.success(this.id, `Burn confirmed: ${JSON.stringify(result).slice(0, 100)}`);
       this.state.lastBurn = Date.now();
       return result;
     } catch (err) {
@@ -138,14 +169,37 @@ export class DACBot {
     }
   }
 
-  async doStake(amount = '0') {
+  async doStake(amount = '0.1') {
     try {
-      logger.info(this.id, `Staking DACC (amount: ${amount})...`);
-      const result = await this.api.confirmStake({ amount });
-      logger.success(this.id, `Stake confirmed: ${JSON.stringify(result).slice(0, 200)}`);
+      logger.info(this.id, `Staking DACC...`);
+      const provider = new ethers.JsonRpcProvider(config.RPC_URL);
+      const signer = this.account.wallet.connect(provider);
+      // Balance check
+      const balance = await provider.getBalance(this.account.address);
+      if (balance < ethers.parseEther(MIN_BALANCE)) {
+        logger.warn(this.id, `Stake skipped: low balance ${ethers.formatEther(balance)} DACC`);
+        return null;
+      }
+      const tx = await signer.sendTransaction({
+        to: DACC_CONTRACT,
+        data: STAKE_SELECTOR,
+        value: ethers.parseEther(TX_VALUE),
+      });
+      logger.info(this.id, `Stake tx: ${tx.hash}`);
+      const receipt = await tx.wait();
+      if (receipt.status === 0) {
+        logger.warn(this.id, `Stake reverted — daily limit reached, skipping`);
+        return null;
+      }
+      const result = await this.api.confirmStake({ tx_hash: tx.hash });
+      logger.success(this.id, `Stake confirmed: ${JSON.stringify(result).slice(0, 100)}`);
       this.state.lastStake = Date.now();
       return result;
     } catch (err) {
+      if (err.code === 'CALL_EXCEPTION') {
+        logger.warn(this.id, `Stake reverted — daily limit or cooldown, skipping`);
+        return null;
+      }
       logger.error(this.id, `Stake failed: ${err.message}`);
       this.state.errors++;
       return null;

@@ -137,7 +137,7 @@ export class InceptionAPI {
   // Wallet sign-in: first get a nonce, then sign and POST
   async walletLogin(address, signedMessage, signature) {
     return this.post(config.API_AUTH_WALLET, {
-      address,
+      wallet_address: address,
       message: signedMessage,
       signature,
     });
