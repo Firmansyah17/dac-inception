@@ -83,7 +83,15 @@ export class InceptionAPI {
     }
 
     const response = await fetch(url, opts);
+    const setCookieRaw = response.headers.raw?.()['set-cookie'] || [];
+    if (process.env.DEBUG_COOKIES) {
+      console.log(`  [DEBUG ${method} ${endpoint}] status=${response.status} set-cookie:`, setCookieRaw);
+    }
     await this.jar.setResponseCookies(response, url);
+    if (process.env.DEBUG_COOKIES) {
+      const all = await this.jar.jar.getCookies(url);
+      console.log(`  [DEBUG ${method} ${endpoint}] jar after:`, all.map(c => `${c.key}=${c.value.slice(0,8)}...(exp=${c.expires})`));
+    }
 
     if (!response.ok) {
       const text = await response.text().catch(() => '');
