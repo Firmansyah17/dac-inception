@@ -76,8 +76,29 @@ export class InceptionAPI {
   }
 
   async fetchCookies() {
-    // Hit homepage to receive csrftoken cookie (Django sets it on any GET)
-    return this.request('GET', '/');
+    // GET /api/auth/wallet/ returns 405 but still sets csrftoken cookie
+    const url = `${this.base}${config.API_AUTH_WALLET}`;
+    try {
+      const res = await fetch(url, {
+        method: 'GET',
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+          'Origin': this.base,
+          'Referer': `${this.base}/`,
+        },
+      });
+      await this.jar.setResponseCookies(res);
+    } catch {}
+    // Also try /api/ as fallback
+    try {
+      const res2 = await fetch(`${this.base}/api/`, {
+        method: 'GET',
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        },
+      });
+      await this.jar.setResponseCookies(res2);
+    } catch {}
   }
 
   async request(method, endpoint, body, extraHeaders = {}) {

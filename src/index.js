@@ -9,54 +9,30 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
 const jitter = (base, range = 5000) => base + Math.floor(Math.random() * range);
 
 async function tryWalletLogin(api, account) {
-  // Step 1: GET the auth endpoint to get a nonce
-  // The site likely exposes a nonce via the profile or sync endpoint
-  let nonce = null;
-  
-  // Try sync first — it may return nonce or session data
-  try {
-    const syncResult = await api.sync();
-    if (syncResult?.nonce) nonce = syncResult.nonce;
-    if (syncResult?.authChallenge) nonce = syncResult.authChallenge;
-  } catch {}
-
-  // If no nonce from sync, try the profile endpoint
-  if (!nonce) {
-    try {
-      const profile = await api.getProfile();
-      if (profile?.nonce) nonce = profile.nonce;
-    } catch {}
-  }
-
   const ts = Date.now().toString();
-  // Format message — try most common dApp format first
-  const msg = nonce
-    ? makeSignInMessage(account.address, nonce, ts)
-    : makeSignInMessage(account.address, '0', ts);
 
-  console.log(`  [Account ${account.id}] Signing message: ${msg.slice(0, 80)}...`);
-  const signature = await account.signMessage(msg);
-
-  // Try wallet login
+  // Try format 1: standard sign-in message
+  const msg1 = makeSignInMessage(account.address, '0', ts);
+  console.log(`  [Account ${account.id}] Signing message: ${msg1.slice(0, 80)}...`);
+  const sig1 = await account.signMessage(msg1);
   try {
-    const result = await api.walletLogin(account.address, msg, signature);
+    const result = await api.walletLogin(account.address, msg1, sig1);
     console.log(`  [Account ${account.id}] Login success: ${JSON.stringify(result).slice(0, 100)}`);
     return true;
   } catch (err) {
-    // Try alternative message format
-    console.log(`  [Account ${account.id}] First login attempt failed, trying alt format...`);
-    const altMsg = nonce
-      ? makeSignInMessageAlt(account.address, nonce)
-      : makeSignInMessageAlt(account.address, '0');
-    const altSig = await account.signMessage(altMsg);
-    try {
-      const result = await api.walletLogin(account.address, altMsg, altSig);
-      console.log(`  [Account ${account.id}] Login success (alt): ${JSON.stringify(result).slice(0, 100)}`);
-      return true;
-    } catch (err2) {
-      console.warn(`  [Account ${account.id}] Login failed: ${err2.message}`);
-      return false;
-    }
+    console.log(`  [Account ${account.id}] Format 1 failed (${err.message.slice(0, 80)}), trying alt...`);
+  }
+
+  // Try format 2: alternative message
+  const msg2 = makeSignInMessageAlt(account.address, '0');
+  const sig2 = await account.signMessage(msg2);
+  try {
+    const result = await api.walletLogin(account.address, msg2, sig2);
+    console.log(`  [Account ${account.id}] Login success (alt): ${JSON.stringify(result).slice(0, 100)}`);
+    return true;
+  } catch (err2) {
+    console.warn(`  [Account ${account.id}] Login failed: ${err2.message.slice(0, 150)}`);
+    return false;
   }
 }
 
