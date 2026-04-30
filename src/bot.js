@@ -99,25 +99,34 @@ export class DACBot {
   async doFaucet() {
     try {
       logger.info(this.id, `Requesting faucet for ${this.account.address}...`);
-      const status = await this.api.faucetStatus(this.account.address);
 
-      // Check if faucet is available
-      if (status && status.status === 'available') {
+      // Probe status (informational only — don't gate on it; many server shapes)
+      let status = null;
+      try {
+        status = await this.api.faucetStatus(this.account.address);
+        logger.info(this.id, `Faucet status: ${JSON.stringify(status).slice(0, 200)}`);
+      } catch (e) {
+        logger.info(this.id, `Faucet status probe failed (continuing): ${e.message.slice(0, 100)}`);
+      }
+
+      // Always attempt the claim; server is source of truth for cooldown
+      try {
         const result = await this.api.faucet(this.account.address);
-        logger.success(this.id, `Faucet claimed: ${JSON.stringify(result).slice(0, 100)}`);
+        logger.success(this.id, `Faucet claimed: ${JSON.stringify(result).slice(0, 200)}`);
         this.state.lastFaucet = Date.now();
         return result;
-      } else {
-        logger.info(this.id, `Faucet not available yet. Status: ${JSON.stringify(status).slice(0, 100)}`);
-        return status;
+      } catch (err) {
+        const m = err.message.toLowerCase();
+        if (m.includes('already') || m.includes('cooldown') || m.includes('wait') ||
+            m.includes('too soon') || m.includes('claimed') || m.includes('429')) {
+          logger.info(this.id, `Faucet on cooldown — skipping (${err.message.slice(0, 120)})`);
+          return null;
+        }
+        throw err;
       }
     } catch (err) {
-      if (err.message.includes('already') || err.message.includes('cooldown') || err.message.includes('available')) {
-        logger.info(this.id, `Faucet on cooldown — skipping`);
-      } else {
-        logger.error(this.id, `Faucet failed: ${err.message}`);
-        this.state.errors++;
-      }
+      logger.error(this.id, `Faucet failed: ${err.message.slice(0, 200)}`);
+      this.state.errors++;
       return null;
     }
   }
