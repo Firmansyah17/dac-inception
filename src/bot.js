@@ -132,87 +132,139 @@ export class DACBot {
   }
 
   async doOpenCrates(count = config.DEFAULT_CRATE_COUNT) {
-    try {
-      logger.info(this.id, `Opening ${count} Quantum Crates...`);
-      const result = await this.api.openCrate(count);
-      logger.success(this.id, `Crates opened: ${JSON.stringify(result).slice(0, 200)}`);
-      this.state.lastCrate = Date.now();
-      return result;
-    } catch (err) {
-      if (err.message.includes('daily limit') || err.message.includes('Maximum') || err.message.includes('already')) {
-        logger.info(this.id, `Crates daily limit reached (${count}/${count}) — skip`);
-      } else {
-        logger.error(this.id, `Open crate failed: ${err.message}`);
+    let claimed = 0;
+    for (let i = 0; i < count; i++) {
+      try {
+        logger.info(this.id, `Opening crate ${i + 1}/${count}...`);
+        const result = await this.api.openCrate(1);
+        const reward = result?.reward?.label || JSON.stringify(result).slice(0, 80);
+        logger.success(this.id, `Crate ${i + 1}: ${reward}`);
+        claimed++;
+        await randomDelay(1000, 3000);
+      } catch (err) {
+        const m = err.message.toLowerCase();
+        if (m.includes('daily limit') || m.includes('maximum') || m.includes('already')) {
+          logger.info(this.id, `Open crate ${i + 1}: daily limit reached — stopping crate opens`);
+          break;
+        }
+        logger.error(this.id, `Open crate ${i + 1} failed: ${err.message.slice(0, 120)}`);
         this.state.errors++;
       }
-      return null;
     }
+    this.state.lastCrate = Date.now();
+    return { claimed, total: count };
   }
 
   async doBurn(amount = '0.1') {
-    try {
-      logger.info(this.id, `Burning DACC → QE...`);
-      const provider = new ethers.JsonRpcProvider(config.RPC_URL);
-      const signer = this.account.wallet.connect(provider);
-      // Balance check
-      const balance = await provider.getBalance(this.account.address);
-      if (balance < ethers.parseEther(MIN_BALANCE)) {
-        logger.warn(this.id, `Burn skipped: low balance ${ethers.formatEther(balance)} DACC`);
-        return null;
+    const maxAttempts = 3;
+    let confirmed = 0;
+    for (let i = 0; i < maxAttempts; i++) {
+      try {
+        logger.info(this.id, `Burn attempt ${i + 1}/${maxAttempts}...`);
+        const provider = new ethers.JsonRpcProvider(config.RPC_URL);
+        const signer = this.account.wallet.connect(provider);
+        const balance = await provider.getBalance(this.account.address);
+        if (balance < ethers.parseEther(MIN_BALANCE)) {
+          logger.warn(this.id, `Burn stopped: low balance ${ethers.formatEther(balance)} DACC`);
+          break;
+        }
+        const tx = await signer.sendTransaction({
+          to: DACC_CONTRACT,
+          data: BURN_SELECTOR,
+          value: ethers.parseEther(TX_VALUE),
+        });
+        logger.info(this.id, `Burn tx: ${tx.hash}`);
+        const receipt = await tx.wait();
+        if (receipt.status === 0) {
+          logger.warn(this.id, `Burn ${i + 1}: tx reverted (daily limit likely) — stopping burns`);
+          break;
+        }
+        // Wait for API to index the tx
+        await sleep(5000);
+        for (let retry = 0; retry < 3; retry++) {
+          try {
+            const result = await this.api.confirmBurn({ tx_hash: tx.hash });
+            logger.success(this.id, `Burn ${i + 1} confirmed: ${JSON.stringify(result).slice(0, 100)}`);
+            confirmed++;
+            break;
+          } catch (e) {
+            if (retry < 2) {
+              logger.info(this.id, `Burn confirm retry ${retry + 1}/3... (${e.message.slice(0, 60)})`);
+              await sleep(3000);
+            } else {
+              logger.error(this.id, `Burn confirm failed: ${e.message.slice(0, 150)}`);
+              this.state.errors++;
+            }
+          }
+        }
+        await randomDelay(2000, 4000);
+      } catch (err) {
+        if (err.code === 'CALL_EXCEPTION') {
+          logger.warn(this.id, `Burn ${i + 1}: tx reverted — stopping burns`);
+          break;
+        }
+        logger.error(this.id, `Burn ${i + 1}: ${err.message.slice(0, 150)}`);
+        this.state.errors++;
       }
-      const tx = await signer.sendTransaction({
-        to: DACC_CONTRACT,
-        data: BURN_SELECTOR,
-        value: ethers.parseEther(TX_VALUE),
-      });
-      logger.info(this.id, `Burn tx: ${tx.hash}`);
-      await tx.wait();
-      const result = await this.api.confirmBurn({ tx_hash: tx.hash });
-      logger.success(this.id, `Burn confirmed: ${JSON.stringify(result).slice(0, 100)}`);
-      this.state.lastBurn = Date.now();
-      return result;
-    } catch (err) {
-      logger.error(this.id, `Burn failed: ${err.message}`);
-      this.state.errors++;
-      return null;
     }
+    this.state.lastBurn = Date.now();
+    return { confirmed, total: maxAttempts };
   }
 
   async doStake(amount = '0.1') {
-    try {
-      logger.info(this.id, `Staking DACC...`);
-      const provider = new ethers.JsonRpcProvider(config.RPC_URL);
-      const signer = this.account.wallet.connect(provider);
-      // Balance check
-      const balance = await provider.getBalance(this.account.address);
-      if (balance < ethers.parseEther(MIN_BALANCE)) {
-        logger.warn(this.id, `Stake skipped: low balance ${ethers.formatEther(balance)} DACC`);
-        return null;
+    const maxAttempts = 5;
+    let confirmed = 0;
+    for (let i = 0; i < maxAttempts; i++) {
+      try {
+        logger.info(this.id, `Stake attempt ${i + 1}/${maxAttempts}...`);
+        const provider = new ethers.JsonRpcProvider(config.RPC_URL);
+        const signer = this.account.wallet.connect(provider);
+        const balance = await provider.getBalance(this.account.address);
+        if (balance < ethers.parseEther(MIN_BALANCE)) {
+          logger.warn(this.id, `Stake stopped: low balance ${ethers.formatEther(balance)} DACC`);
+          break;
+        }
+        const tx = await signer.sendTransaction({
+          to: DACC_CONTRACT,
+          data: STAKE_SELECTOR,
+          value: ethers.parseEther(TX_VALUE),
+        });
+        logger.info(this.id, `Stake tx: ${tx.hash}`);
+        const receipt = await tx.wait();
+        if (receipt.status === 0) {
+          logger.warn(this.id, `Stake ${i + 1}: tx reverted (daily limit likely) — stopping stakes`);
+          break;
+        }
+        // Wait for API to index the tx
+        await sleep(8000);
+        for (let retry = 0; retry < 3; retry++) {
+          try {
+            const result = await this.api.confirmStake({ tx_hash: tx.hash });
+            logger.success(this.id, `Stake ${i + 1} confirmed: ${JSON.stringify(result).slice(0, 100)}`);
+            confirmed++;
+            break;
+          } catch (e) {
+            if (retry < 2) {
+              logger.info(this.id, `Stake confirm retry ${retry + 1}/3... (${e.message.slice(0, 60)})`);
+              await sleep(5000);
+            } else {
+              logger.error(this.id, `Stake ${i + 1} confirm failed: ${e.message.slice(0, 150)}`);
+              this.state.errors++;
+            }
+          }
+        }
+        await randomDelay(3000, 5000);
+      } catch (err) {
+        if (err.code === 'CALL_EXCEPTION') {
+          logger.warn(this.id, `Stake ${i + 1}: tx reverted — stopping stakes`);
+          break;
+        }
+        logger.error(this.id, `Stake ${i + 1}: ${err.message.slice(0, 150)}`);
+        this.state.errors++;
       }
-      const tx = await signer.sendTransaction({
-        to: DACC_CONTRACT,
-        data: STAKE_SELECTOR,
-        value: ethers.parseEther(TX_VALUE),
-      });
-      logger.info(this.id, `Stake tx: ${tx.hash}`);
-      const receipt = await tx.wait();
-      if (receipt.status === 0) {
-        logger.warn(this.id, `Stake reverted — daily limit reached, skipping`);
-        return null;
-      }
-      const result = await this.api.confirmStake({ tx_hash: tx.hash });
-      logger.success(this.id, `Stake confirmed: ${JSON.stringify(result).slice(0, 100)}`);
-      this.state.lastStake = Date.now();
-      return result;
-    } catch (err) {
-      if (err.code === 'CALL_EXCEPTION') {
-        logger.warn(this.id, `Stake reverted — daily limit or cooldown, skipping`);
-        return null;
-      }
-      logger.error(this.id, `Stake failed: ${err.message}`);
-      this.state.errors++;
-      return null;
     }
+    this.state.lastStake = Date.now();
+    return { confirmed, total: maxAttempts };
   }
 
   async reportStatus() {
