@@ -8,6 +8,59 @@ import { loadState, saveState, updateAccountRun, incrementError } from './state-
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 const jitter = (base, range = 5000) => base + Math.floor(Math.random() * range);
 
+// ─── CLI argument parsing ───────────────────────────────────────────
+const args = process.argv.slice(2);
+const cli = {
+  mode: 'interval',
+  accounts: [],       // empty = both, [1] or [2] for specific
+  skipFaucet: false,
+  skipCrates: false,
+  skipBurn: false,
+  skipStake: false,
+  help: false,
+};
+
+for (let i = 0; i < args.length; i++) {
+  switch (args[i]) {
+    case '--help': case '-h':
+      cli.help = true;
+      break;
+    case '--once': case '-o':
+      cli.mode = 'once';
+      break;
+    case '--account': case '-a':
+      if (args[i + 1] && /^[12]$/.test(args[i + 1])) {
+        cli.accounts.push(parseInt(args[++i], 10));
+      } else {
+        console.error(`Invalid --account value: ${args[i + 1]} (use 1 or 2)`);
+        process.exit(1);
+      }
+      break;
+    case '--skip-faucet': cli.skipFaucet = true; break;
+    case '--skip-crates': cli.skipCrates = true; break;
+    case '--skip-burn': cli.skipBurn = true; break;
+    case '--skip-stake': cli.skipStake = true; break;
+  }
+}
+
+if (cli.help) {
+  console.log(`DAC Inception Bot — Usage:
+  node src/index.js                    # Default: both accounts, all actions, every 24h
+  node src/index.js --once             # Single run, then exit
+  node src/index.js --once -a 1        # Single run, account 1 only
+  node src/index.js --skip-burn        # Run without burn/stake (good when daily limit hit)
+  node src/index.js --once -a 2 --skip-crates  # Account 2, skip crates
+
+Account controls (env vars, per-account):
+  BURN_ENABLED=false / STAKE_ENABLED=false   # Disable for both accounts
+  BURN_ENABLED_1=false                       # Disable burn for account 1 only
+  STAKE_ENABLED_2=false                      # Disable stake for account 2 only
+  CRATE_COUNT_1=3                            # Custom crate count for account 1
+  CRATE_COUNT_2=5                            # Custom crate count for account 2
+`);
+  process.exit(0);
+}
+
 async function tryWalletLogin(api, account) {
   const ts = Date.now().toString();
 
@@ -78,6 +131,18 @@ async function main() {
     }
   }
 
+  // Filter accounts based on CLI --account flags
+  if (cli.accounts.length > 0) {
+    const filtered = accounts.filter(a => cli.accounts.includes(a.id));
+    if (filtered.length === 0) {
+      console.error(`No matching accounts for --account ${cli.accounts.join(',')}`);
+      process.exit(1);
+    }
+    accounts.length = 0;
+    accounts.push(...filtered);
+    console.log(`Filtered to accounts: ${accounts.map(a => a.id).join(', ')}\n`);
+  }
+
   if (accounts.length === 0) {
     console.error('No accounts configured. Edit .env and set ACCOUNT_1_PRIVATE_KEY at minimum.');
     console.log('  cp .env.example .env  # then edit .env with your actual keys');
@@ -90,57 +155,62 @@ async function main() {
   console.log(`Crates per run: ${process.env.CRATE_OPEN_COUNT || config.DEFAULT_CRATE_COUNT}`);
   console.log('---\n');
 
-  // Initial cycle
-  for (const acct of accounts) {
-    console.log(`\n[Account ${acct.id}] ${acct.address}`);
-    try {
-      await runSingleCycle(acct, {
-        doFaucet: true,
-        crateCount: parseInt(process.env.CRATE_OPEN_COUNT || config.DEFAULT_CRATE_COUNT, 10),
-        doBurn: process.env.BURN_ENABLED === 'true',
-        doStake: process.env.STAKE_ENABLED === 'true',
-        burnAmount: process.env.BURN_AMOUNT || '0',
-        stakeAmount: process.env.STAKE_AMOUNT || '0',
-      });
-      updateAccountRun(state, acct.id, 'faucet', acct.address);
-    } catch (err) {
-      console.error(`  [Account ${acct.id}] Cycle failed: ${err.message}`);
-      incrementError(state, acct.id);
-    }
-    if (accounts.indexOf(acct) < accounts.length - 1) {
-      await sleep(jitter(30000, 15000));
-    }
-  }
+  // Per-account options helper
+  const getPerAccountBool = (envKey, id, globalDefault) => {
+    const perAcct = process.env[`${envKey}_${id}`];
+    if (perAcct !== undefined) return perAcct === 'true';
+    const global = process.env[envKey];
+    if (global !== undefined) return global === 'true';
+    return globalDefault;
+  };
+  const getPerAccountValue = (envKey, id, globalDefault) => {
+    return process.env[`${envKey}_${id}`] || process.env[envKey] || globalDefault;
+  };
 
-  // Schedule recurring
-  const intervalMs = parseInt(process.env.FAUCET_INTERVAL_HOURS || '24', 10) * 60 * 60 * 1000;
-  console.log(`\nNext cycle in ${intervalMs / 3600000} hours...`);
-  setInterval(async () => {
+  // Helper to build cycle opts per account
+  const buildOpts = (acct) => ({
+    doFaucet: !cli.skipFaucet,
+    crateCount: parseInt(getPerAccountValue('CRATE_COUNT', acct.id, process.env.CRATE_OPEN_COUNT || config.DEFAULT_CRATE_COUNT), 10),
+    doBurn: !cli.skipBurn && getPerAccountBool('BURN_ENABLED', acct.id, false),
+    doStake: !cli.skipStake && getPerAccountBool('STAKE_ENABLED', acct.id, false),
+    burnAmount: getPerAccountValue('BURN_AMOUNT', acct.id, '0'),
+    stakeAmount: getPerAccountValue('STAKE_AMOUNT', acct.id, '0'),
+  });
+
+  // Run cycle function
+  const runAll = async () => {
     const ts = new Date().toISOString();
-    console.log(`\n${ts} — Scheduled cycle`);
-    state.lastScheduledRun = ts;
-    saveState(state);
-
+    if (cli.mode !== 'once') {
+      console.log(`\n${ts} — Cycle`);
+      state.lastScheduledRun = ts;
+      saveState(state);
+    }
     for (const acct of accounts) {
+      console.log(`\n[Account ${acct.id}] ${acct.address}`);
       try {
-        await runSingleCycle(acct, {
-          doFaucet: true,
-          crateCount: parseInt(process.env.CRATE_OPEN_COUNT || config.DEFAULT_CRATE_COUNT, 10),
-          doBurn: process.env.BURN_ENABLED === 'true',
-          doStake: process.env.STAKE_ENABLED === 'true',
-          burnAmount: process.env.BURN_AMOUNT || '0',
-          stakeAmount: process.env.STAKE_AMOUNT || '0',
-        });
+        await runSingleCycle(acct, buildOpts(acct));
         updateAccountRun(state, acct.id, 'faucet', acct.address);
       } catch (err) {
-        console.error(`  [Account ${acct.id}] Scheduled cycle failed: ${err.message}`);
+        console.error(`  [Account ${acct.id}] Cycle failed: ${err.message}`);
         incrementError(state, acct.id);
       }
       if (accounts.indexOf(acct) < accounts.length - 1) {
         await sleep(jitter(30000, 15000));
       }
     }
-  }, intervalMs);
+  };
+
+  await runAll();
+
+  // Schedule recurring (skip if --once)
+  if (cli.mode !== 'once') {
+    const intervalMs = parseInt(process.env.FAUCET_INTERVAL_HOURS || '24', 10) * 60 * 60 * 1000;
+    console.log(`\nNext cycle in ${intervalMs / 3600000} hours...`);
+    setInterval(runAll, intervalMs);
+  } else {
+    console.log('\n--once mode: exiting after single cycle.');
+    process.exit(0);
+  }
 }
 
 main().catch(err => {

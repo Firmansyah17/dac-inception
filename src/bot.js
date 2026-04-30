@@ -158,10 +158,18 @@ export class DACBot {
   async doBurn(amount = '0.1') {
     const maxAttempts = 3;
     let confirmed = 0;
+    let provider;
+    try {
+      provider = new ethers.JsonRpcProvider(config.RPC_URL);
+      await provider.getBlockNumber();
+    } catch (rpcErr) {
+      logger.error(this.id, `RPC unavailable — skipping burn (${rpcErr.message.slice(0, 100)})`);
+      this.state.lastBurn = Date.now();
+      return { confirmed, total: maxAttempts, rpcDown: true };
+    }
     for (let i = 0; i < maxAttempts; i++) {
       try {
         logger.info(this.id, `Burn attempt ${i + 1}/${maxAttempts}...`);
-        const provider = new ethers.JsonRpcProvider(config.RPC_URL);
         const signer = this.account.wallet.connect(provider);
         const balance = await provider.getBalance(this.account.address);
         if (balance < ethers.parseEther(MIN_BALANCE)) {
@@ -214,10 +222,18 @@ export class DACBot {
   async doStake(amount = '0.1') {
     const maxAttempts = 5;
     let confirmed = 0;
+    let provider;
+    try {
+      provider = new ethers.JsonRpcProvider(config.RPC_URL);
+      await provider.getBlockNumber();
+    } catch (rpcErr) {
+      logger.error(this.id, `RPC unavailable — skipping stake (${rpcErr.message.slice(0, 100)})`);
+      this.state.lastStake = Date.now();
+      return { confirmed, total: maxAttempts, rpcDown: true };
+    }
     for (let i = 0; i < maxAttempts; i++) {
       try {
         logger.info(this.id, `Stake attempt ${i + 1}/${maxAttempts}...`);
-        const provider = new ethers.JsonRpcProvider(config.RPC_URL);
         const signer = this.account.wallet.connect(provider);
         const balance = await provider.getBalance(this.account.address);
         if (balance < ethers.parseEther(MIN_BALANCE)) {
