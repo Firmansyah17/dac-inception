@@ -1,74 +1,34 @@
+import fetch from 'node-fetch';
+import { CookieJar as ToughCookieJar } from 'tough-cookie';
 import config from './config.js';
 
-// Cookie jar for session persistence
+// Wrapper around tough-cookie with helper for CSRF token
 export class CookieJar {
   constructor() {
-    this.cookies = new Map();
-    this.csrfToken = null;
+    this.jar = new ToughCookieJar();
+    this.lastUrl = config.INCEPTION_BASE;
   }
 
-  setCookieString(raw) {
-    if (!raw) return;
-    const parts = raw.split(';');
-    const nameValue = parts[0].trim().split('=');
-    if (nameValue.length >= 2) {
-      this.cookies.set(nameValue[0], nameValue.slice(1).join('='));
+  async setResponseCookies(response, url) {
+    const setCookieHeaders = response.headers.raw?.()['set-cookie'] || [];
+    for (const cookie of setCookieHeaders) {
+      try {
+        await this.jar.setCookie(cookie, url || this.lastUrl);
+      } catch {}
     }
   }
 
-  getCookieHeader() {
-    const pairs = [...this.cookies.entries()].map(([k, v]) => `${k}=${v}`);
-    return pairs.join('; ') || undefined;
+  async getCookieHeader(url) {
+    return this.jar.getCookieString(url || this.lastUrl);
   }
 
-  getCsrfToken() {
-    // Django usually stores CSRF in 'csrftoken' cookie
-    return this.csrfToken || this.cookies.get('csrftoken') || null;
-  }
-
-  async setResponseCookies(response) {
-    // Use getSetCookies() if available (Node.js 20+), otherwise fallback parsing
-    let cookieHeaders = [];
-    if (typeof response.headers.getSetCookies === 'function') {
-      cookieHeaders = response.headers.getSetCookies();
-      cookieHeaders.forEach(c => {
-        if (c && c.name) {
-          this.cookies.set(c.name, c.value);
-          if (c.name.toLowerCase() === 'csrftoken') {
-            this.csrfToken = c.value;
-          }
-        }
-      });
-    } else {
-      const setCookie = response.headers.get('set-cookie');
-      if (setCookie) {
-        // Parse multiple Set-Cookie headers properly
-        const cookieLines = setCookie.split('\n');
-        cookieLines.forEach(line => this._parseLine(line));
-        // Fallback: split by comma only for cookie boundaries
-        const parts = setCookie.split(/(?=^[\w\-]+=)/m);
-        parts.forEach(p => this._parseLine(p));
-      }
-    }
-  }
-
-  _parseLine(line) {
-    if (!line) return;
-    const trimmed = line.trim();
-    const idx = trimmed.indexOf('=');
-    if (idx > 0) {
-      const name = trimmed.slice(0, idx).trim();
-      const valEnd = trimmed.indexOf(';');
-      const value = (valEnd > idx ? trimmed.slice(idx + 1, valEnd) : trimmed.slice(idx + 1)).trim();
-      this.cookies.set(name, value);
-      if (name.toLowerCase() === 'csrftoken') {
-        this.csrfToken = value;
-      }
-    }
+  async getCsrfToken(url) {
+    const cookies = await this.jar.getCookies(url || this.lastUrl);
+    const csrf = cookies.find(c => c.key === 'csrftoken');
+    return csrf?.value || null;
   }
 }
 
-// Simple authenticated API client using cookies
 export class InceptionAPI {
   constructor(cookieJar) {
     this.jar = cookieJar;
@@ -76,29 +36,24 @@ export class InceptionAPI {
   }
 
   async fetchCookies() {
-    // GET /api/auth/wallet/ returns 405 but still sets csrftoken cookie
-    const url = `${this.base}${config.API_AUTH_WALLET}`;
-    try {
-      const res = await fetch(url, {
-        method: 'GET',
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-          'Origin': this.base,
-          'Referer': `${this.base}/`,
-        },
-      });
-      await this.jar.setResponseCookies(res);
-    } catch {}
-    // Also try /api/ as fallback
-    try {
-      const res2 = await fetch(`${this.base}/api/`, {
-        method: 'GET',
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-        },
-      });
-      await this.jar.setResponseCookies(res2);
-    } catch {}
+    // GET endpoints that set csrftoken cookie
+    for (const path of ['/api/auth/wallet/', '/api/']) {
+      const url = `${this.base}${path}`;
+      try {
+        const res = await fetch(url, {
+          method: 'GET',
+          headers: {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'Origin': this.base,
+            'Referer': `${this.base}/`,
+          },
+        });
+        await this.jar.setResponseCookies(res, url);
+        const token = await this.jar.getCsrfToken(url);
+        if (token) return token;
+      } catch {}
+    }
+    return null;
   }
 
   async request(method, endpoint, body, extraHeaders = {}) {
@@ -108,34 +63,27 @@ export class InceptionAPI {
       'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
       'Origin': this.base,
       'Referer': `${this.base}/`,
+      'Accept': 'application/json',
       ...extraHeaders,
     };
 
-    const cookieHeader = this.jar.getCookieHeader();
-    if (cookieHeader) {
-      headers['Cookie'] = cookieHeader;
-    }
+    const cookieHeader = await this.jar.getCookieHeader(url);
+    if (cookieHeader) headers['Cookie'] = cookieHeader;
 
-    // Inject CSRF token for state-changing methods
     if (['POST', 'PUT', 'PATCH', 'DELETE'].includes(method)) {
-      const token = this.jar.getCsrfToken();
+      const token = await this.jar.getCsrfToken(url);
       if (token && !headers['X-CSRFToken']) {
         headers['X-CSRFToken'] = token;
       }
     }
 
-    const opts = {
-      method,
-      headers,
-      credentials: 'include',
-    };
-
+    const opts = { method, headers };
     if (body && ['POST', 'PUT', 'PATCH'].includes(method)) {
       opts.body = JSON.stringify(body);
     }
 
     const response = await fetch(url, opts);
-    await this.jar.setResponseCookies(response);
+    await this.jar.setResponseCookies(response, url);
 
     if (!response.ok) {
       const text = await response.text().catch(() => '');
@@ -146,7 +94,6 @@ export class InceptionAPI {
     if (ct.includes('application/json')) {
       return response.json();
     }
-    // Drain body so connection is freed
     await response.text().catch(() => '');
     return null;
   }
@@ -154,8 +101,6 @@ export class InceptionAPI {
   get(endpoint) { return this.request('GET', endpoint); }
   post(endpoint, body) { return this.request('POST', endpoint, body); }
 
-  // --- Auth flow: sign a message to authenticate ---
-  // Wallet sign-in: first get a nonce, then sign and POST
   async walletLogin(address, signedMessage, signature) {
     return this.post(config.API_AUTH_WALLET, {
       wallet_address: address,
@@ -164,60 +109,18 @@ export class InceptionAPI {
     });
   }
 
-  // --- Core endpoints ---
-  async getProfile() {
-    return this.get(config.API_PROFILE);
-  }
-
-  async faucet(walletAddress) {
-    return this.post(config.API_FAUCET, { wallet: walletAddress });
-  }
-
-  async faucetStatus(walletAddress) {
-    return this.get(config.API_FAUCET_STATUS.replace('${B}', walletAddress));
-  }
-
-  async faucetHistory() {
-    return this.get(config.API_FAUCET_HISTORY);
-  }
-
-  async openCrate(count = config.DEFAULT_CRATE_COUNT) {
-    return this.post(config.API_CRATE_OPEN, { count });
-  }
-
-  async crateHistory() {
-    return this.get(config.API_CRATE_HISTORY);
-  }
-
-  async confirmBurn(params) {
-    return this.post(config.API_EXCHANGE_BURN, params);
-  }
-
-  async confirmStake(params) {
-    return this.post(config.API_EXCHANGE_STAKE, params);
-  }
-
-  async exchangeHistory() {
-    return this.get(config.API_EXCHANGE_HISTORY);
-  }
-
-  async claimBadge() {
-    return this.post(config.API_BADGE_CLAIM, {});
-  }
-
-  async sync() {
-    return this.post(config.API_SYNC, {});
-  }
-
-  async getTasks() {
-    return this.get(config.API_TASK);
-  }
-
-  async getQeHistory() {
-    return this.get(config.API_QE_HISTORY);
-  }
-
-  async leaderboard() {
-    return this.get(config.API_LEADERBOARD);
-  }
+  async getProfile() { return this.get(config.API_PROFILE); }
+  async faucet(walletAddress) { return this.post(config.API_FAUCET, { wallet: walletAddress }); }
+  async faucetStatus(walletAddress) { return this.get(config.API_FAUCET_STATUS.replace('${B}', walletAddress)); }
+  async faucetHistory() { return this.get(config.API_FAUCET_HISTORY); }
+  async openCrate(count = config.DEFAULT_CRATE_COUNT) { return this.post(config.API_CRATE_OPEN, { count }); }
+  async crateHistory() { return this.get(config.API_CRATE_HISTORY); }
+  async confirmBurn(params) { return this.post(config.API_EXCHANGE_BURN, params); }
+  async confirmStake(params) { return this.post(config.API_EXCHANGE_STAKE, params); }
+  async exchangeHistory() { return this.get(config.API_EXCHANGE_HISTORY); }
+  async claimBadge() { return this.post(config.API_BADGE_CLAIM, {}); }
+  async sync() { return this.post(config.API_SYNC, {}); }
+  async getTasks() { return this.get(config.API_TASK); }
+  async getQeHistory() { return this.get(config.API_QE_HISTORY); }
+  async leaderboard() { return this.get(config.API_LEADERBOARD); }
 }
