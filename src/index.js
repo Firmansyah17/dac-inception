@@ -4,6 +4,7 @@ import { CookieJar } from './api.js';
 import { DACBot } from './bot.js';
 import config from './config.js';
 import { loadState, saveState, updateAccountRun, incrementError } from './state-manager.js';
+import { createInterface } from 'readline';
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 const jitter = (base, range = 5000) => base + Math.floor(Math.random() * range);
@@ -13,6 +14,7 @@ const args = process.argv.slice(2);
 const cli = {
   mode: 'interval',
   accounts: [],       // empty = both, [1] or [2] for specific
+  interactive: false,
   skipFaucet: false,
   skipCrates: false,
   skipBurn: false,
@@ -36,6 +38,7 @@ for (let i = 0; i < args.length; i++) {
         process.exit(1);
       }
       break;
+    case '--interactive': case '-i': cli.interactive = true; break;
     case '--skip-faucet': cli.skipFaucet = true; break;
     case '--skip-crates': cli.skipCrates = true; break;
     case '--skip-burn': cli.skipBurn = true; break;
@@ -45,18 +48,18 @@ for (let i = 0; i < args.length; i++) {
 
 if (cli.help) {
   console.log(`DAC Inception Bot — Usage:
-  node src/index.js                    # Default: both accounts, all actions, every 24h
-  node src/index.js --once             # Single run, then exit
-  node src/index.js --once -a 1        # Single run, account 1 only
-  node src/index.js --skip-burn        # Run without burn/stake (good when daily limit hit)
-  node src/index.js --once -a 2 --skip-crates  # Account 2, skip crates
+  node src/index.js                           # Default: both accounts, all actions, every 24h
+  node src/index.js --interactive             # Choose accounts at startup (interactive menu)
+  node src/index.js --once                    # Single run (auto-selects both), then exit
+  node src/index.js --once -a 1               # Single run, account 1 only
+  node src/index.js --once -a 2 --skip-crates # Account 2, skip crates
+  node src/index.js --once -i                 # Interactive + once (pick, run, exit)
+  node src/index.js --track-faucet            # Check recent faucet TX status for all accounts
 
 Account controls (env vars, per-account):
   BURN_ENABLED=false / STAKE_ENABLED=false   # Disable for both accounts
   BURN_ENABLED_1=false                       # Disable burn for account 1 only
-  STAKE_ENABLED_2=false                      # Disable stake for account 2 only
   CRATE_COUNT_1=3                            # Custom crate count for account 1
-  CRATE_COUNT_2=5                            # Custom crate count for account 2
 `);
   process.exit(0);
 }
@@ -149,6 +152,58 @@ async function main() {
     process.exit(1);
   }
 
+  // ─── Interactive account selection ────────────────────────────────
+  if (cli.interactive) {
+    const rl = createInterface({ input: process.stdin, output: process.stdout });
+    const ask = (q) => new Promise((res) => rl.question(q, res));
+    console.log('\n=== Select Accounts ===');
+    console.log('1. Account 1');
+    console.log('2. Account 2');
+    console.log('3. Both accounts');
+    console.log('4. Track faucet status only');
+    console.log('5. Exit\n');
+    const choice = (await ask('Select [1-5]: ')).trim();
+    if (choice === '4') {
+      rl.close();
+      return await checkFaucetTracker(accounts);
+    }
+    if (choice === '5' || !choice) {
+      rl.close();
+      process.exit(0);
+    }
+    if (choice === '3') {
+      // both — cli.accounts already empty
+    } else if (choice === '1' || choice === '2') {
+      const acctId = parseInt(choice, 10);
+      const filtered = accounts.filter(a => a.id === acctId);
+      if (filtered.length === 0) {
+        console.error(`Account ${acctId} not configured.`);
+        rl.close();
+        process.exit(1);
+      }
+      accounts.length = 0;
+      accounts.push(...filtered);
+      console.log(`Selected: Account ${acctId}\n`);
+    } else {
+      console.log(`Invalid choice "${choice}" — defaulting to both.`);
+    }
+
+    // Action selection
+    console.log('\n=== Select Actions ===');
+    console.log('Actions enabled: faucet, crates, burn, stake');
+    const skipAns = (await ask('Skip any? (e.g. "burn stake" or ENTER for none): ')).trim().toLowerCase();
+    if (skipAns.includes('faucet')) cli.skipFaucet = true;
+    if (skipAns.includes('crate')) cli.skipCrates = true;
+    if (skipAns.includes('burn')) cli.skipBurn = true;
+    if (skipAns.includes('stake')) cli.skipStake = true;
+
+    // Once or scheduled
+    const schedAns = (await ask('Run once or schedule? (once/schedule, default=schedule): ')).trim().toLowerCase();
+    if (schedAns === 'once') cli.mode = 'once';
+    rl.close();
+    console.log('\n');
+  }
+
   console.log('\n=== DAC Inception Bot ===');
   console.log(`Accounts loaded: ${accounts.length}`);
   console.log(`Interval: ${process.env.FAUCET_INTERVAL_HOURS || 24}h`);
@@ -209,6 +264,61 @@ async function main() {
     setInterval(runAll, intervalMs);
   } else {
     console.log('\n--once mode: exiting after single cycle.');
+    process.exit(0);
+  }
+
+  // Faucet dispense tracking helper
+  async function checkFaucetTracker(availableAccounts) {
+    console.log('\n=== Faucet Dispense Tracker ===');
+    const results = [];
+    for (const acct of availableAccounts) {
+      console.log(`\n[Account ${acct.id}] ${acct.address}`);
+      try {
+        const jar = new CookieJar();
+        const bot = new DACBot(acct, jar);
+        await bot.api.fetchCookies();
+        const loggedIn = await tryWalletLogin(bot.api, acct);
+        if (!loggedIn) {
+          console.log(`  ⚠️ Not logged in — fetching public info only`);
+        }
+
+        // Sync session to get latest balance + tx_count
+        const session = await bot.api.syncSession();
+        console.log(`  DACC balance: ${session.dacc_balance ?? 'N/A'}`);
+        console.log(`  TX count:     ${session.tx_count ?? 'N/A'}`);
+        console.log(`  QE balance:   ${session.qe_balance ?? 'N/A'}`);
+        console.log(`  Streak days:  ${session.streak_days ?? 'N/A'}`);
+        results.push({ account: acct.id, success: true, ...session });
+      } catch (err) {
+        console.log(`  ❌ Session check failed: ${err.message.slice(0, 150)}`);
+        results.push({ account: acct.id, success: false, error: err.message });
+      }
+
+      // Check faucet status via API
+      console.log('  Checking recent dispenses...');
+      try {
+        const jar = new CookieJar();
+        const bot = new DACBot(acct, jar);
+        await bot.api.fetchCookies();
+        await tryWalletLogin(bot.api, acct);
+        const profile = await bot.api.getProfile();
+        if (profile.dacc_balance) {
+          console.log(`  Profile DACC balance: ${profile.dacc_balance}`);
+        }
+        if (profile.tx_count !== undefined) {
+          console.log(`  Profile TX count: ${profile.tx_count}`);
+        }
+      } catch (err) {
+        console.log(`  ⚠️ Could not fetch profile: ${err.message.slice(0, 100)}`);
+      }
+
+      if (availableAccounts.indexOf(acct) < availableAccounts.length - 1) {
+        await sleep(2000);
+      }
+    }
+
+    console.log('\n=== Faucet Tracker Complete ===');
+    console.log(JSON.stringify(results, null, 2));
     process.exit(0);
   }
 }

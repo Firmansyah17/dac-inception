@@ -162,9 +162,12 @@ export class DACBot {
     return { claimed, total: count };
   }
 
-  async doBurn(amount = '0.1') {
-    const maxAttempts = 3;
+  async doBurn(amount = '0') {
+    const targetConfirmed = 3;
+    const maxAttempts = 20;
     let confirmed = 0;
+    let attempts = 0;
+
     let provider;
     try {
       provider = new ethers.JsonRpcProvider(config.RPC_URL);
@@ -172,15 +175,17 @@ export class DACBot {
     } catch (rpcErr) {
       logger.error(this.id, `RPC unavailable — skipping burn (${rpcErr.message.slice(0, 100)})`);
       this.state.lastBurn = Date.now();
-      return { confirmed, total: maxAttempts, rpcDown: true };
+      return { confirmed, target: targetConfirmed, attempts: 0, rpcDown: true };
     }
-    for (let i = 0; i < maxAttempts; i++) {
+
+    while (confirmed < targetConfirmed && attempts < maxAttempts) {
+      attempts++;
       try {
-        logger.info(this.id, `Burn attempt ${i + 1}/${maxAttempts}...`);
+        logger.info(this.id, `Burn attempt ${attempts}/${maxAttempts} (${confirmed}/${targetConfirmed} confirmed)...`);
         const signer = this.account.wallet.connect(provider);
         const balance = await provider.getBalance(this.account.address);
         if (balance < ethers.parseEther(MIN_BALANCE)) {
-          logger.warn(this.id, `Burn stopped: low balance ${ethers.formatEther(balance)} DACC`);
+          logger.warn(this.id, `Burn stopped: low balance ${ethers.formatEther(balance)} ETH`);
           break;
         }
         const tx = await signer.sendTransaction({
@@ -191,16 +196,19 @@ export class DACBot {
         logger.info(this.id, `Burn tx: ${tx.hash}`);
         const receipt = await tx.wait();
         if (receipt.status === 0) {
-          logger.warn(this.id, `Burn ${i + 1}: tx reverted (daily limit likely) — stopping burns`);
-          break;
+          logger.warn(this.id, `Burn attempt ${attempts}: tx reverted — retrying (daily limit)`);
+          await sleep(3000);
+          continue; // keep trying, don't break
         }
         // Wait for API to index the tx
-        await sleep(5000);
+        await sleep(8000);
+        let confirmOk = false;
         for (let retry = 0; retry < 3; retry++) {
           try {
             const result = await this.api.confirmBurn({ tx_hash: tx.hash });
-            logger.success(this.id, `Burn ${i + 1} confirmed: ${JSON.stringify(result).slice(0, 100)}`);
             confirmed++;
+            logger.success(this.id, `Burn ${confirmed}/${targetConfirmed} confirmed: ${JSON.stringify(result).slice(0, 100)}`);
+            confirmOk = true;
             break;
           } catch (e) {
             if (retry < 2) {
@@ -212,18 +220,29 @@ export class DACBot {
             }
           }
         }
+        if (!confirmOk) {
+          logger.warn(this.id, `Burn tx on-chain but API confirm failed — does not count toward target`);
+        }
         await randomDelay(2000, 4000);
       } catch (err) {
         if (err.code === 'CALL_EXCEPTION') {
-          logger.warn(this.id, `Burn ${i + 1}: tx reverted — stopping burns`);
-          break;
+          logger.warn(this.id, `Burn attempt ${attempts}: tx reverted — retrying`);
+          await sleep(3000);
+          continue;
         }
-        logger.error(this.id, `Burn ${i + 1}: ${err.message.slice(0, 150)}`);
+        logger.error(this.id, `Burn attempt ${attempts}: ${err.message.slice(0, 150)}`);
         this.state.errors++;
+        await sleep(2000);
       }
     }
+
+    if (confirmed >= targetConfirmed) {
+      logger.success(this.id, `Burn target reached: ${confirmed}/${targetConfirmed} confirmed`);
+    } else {
+      logger.warn(this.id, `Burn session ended: ${confirmed}/${targetConfirmed} confirmed (${attempts} attempts, max ${maxAttempts})`);
+    }
     this.state.lastBurn = Date.now();
-    return { confirmed, total: maxAttempts };
+    return { confirmed, target: targetConfirmed, attempts };
   }
 
   async doStake(amount = '0') {
