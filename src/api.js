@@ -76,8 +76,8 @@ export class InceptionAPI {
   }
 
   async fetchCookies() {
-    // Hit /api/csrf/ to receive csrftoken cookie
-    return this.request('GET', '/api/csrf/');
+    // Hit homepage to receive csrftoken cookie (Django sets it on any GET)
+    return this.request('GET', '/');
   }
 
   async request(method, endpoint, body, extraHeaders = {}) {
