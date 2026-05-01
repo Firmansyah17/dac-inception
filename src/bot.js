@@ -196,9 +196,8 @@ export class DACBot {
         logger.info(this.id, `Burn tx: ${tx.hash}`);
         const receipt = await tx.wait();
         if (receipt.status === 0) {
-          logger.warn(this.id, `Burn attempt ${attempts}: tx reverted — retrying (daily limit)`);
-          await sleep(3000);
-          continue; // keep trying, don't break
+          logger.warn(this.id, `Burn tx reverted — likely daily/cool-down limit. Stopping burn loop.`);
+          break; // revert after 1+ success means limit hit; stop gracefully
         }
         // Wait for API to index the tx
         await sleep(8000);
@@ -213,7 +212,7 @@ export class DACBot {
           } catch (e) {
             if (retry < 2) {
               logger.info(this.id, `Burn confirm retry ${retry + 1}/3... (${e.message.slice(0, 60)})`);
-              await sleep(3000);
+              await sleep(2000);
             } else {
               logger.error(this.id, `Burn confirm failed: ${e.message.slice(0, 150)}`);
               this.state.errors++;
@@ -226,11 +225,10 @@ export class DACBot {
         await randomDelay(2000, 4000);
       } catch (err) {
         if (err.code === 'CALL_EXCEPTION') {
-          logger.warn(this.id, `Burn attempt ${attempts}: tx reverted — retrying`);
-          await sleep(3000);
-          continue;
+          logger.warn(this.id, `Burn tx reverted (CALL_EXCEPTION) — likely daily/cool-down limit. Stopping.`);
+          break;
         }
-        logger.error(this.id, `Burn attempt ${attempts}: ${err.message.slice(0, 150)}`);
+        logger.error(this.id, `Burn attempt ${attempts}: ${err.message.slice(0, 200)}`);
         this.state.errors++;
         await sleep(2000);
       }
@@ -279,9 +277,8 @@ export class DACBot {
         logger.info(this.id, `Stake tx: ${tx.hash}`);
         const receipt = await tx.wait();
         if (receipt.status === 0) {
-          logger.warn(this.id, `Stake attempt ${attempts}: tx reverted — retrying (cooldown/daily limit)`);
-          await sleep(3000);
-          continue; // keep trying, don't break
+          logger.warn(this.id, `Stake tx reverted — likely daily/cool-down limit. Stopping stake loop.`);
+          break; // revert after 1+ success means limit hit; stop gracefully
         }
         // Wait for API to index the tx
         await sleep(8000);
@@ -296,7 +293,7 @@ export class DACBot {
           } catch (e) {
             if (retry < 2) {
               logger.info(this.id, `Stake confirm retry ${retry + 1}/3... (${e.message.slice(0, 60)})`);
-              await sleep(5000);
+              await sleep(2000);
             } else {
               logger.error(this.id, `Stake confirm failed: ${e.message.slice(0, 150)}`);
               this.state.errors++;
@@ -309,11 +306,10 @@ export class DACBot {
         await randomDelay(2000, 4000);
       } catch (err) {
         if (err.code === 'CALL_EXCEPTION') {
-          logger.warn(this.id, `Stake attempt ${attempts}: tx reverted — retrying`);
-          await sleep(3000);
-          continue;
+          logger.warn(this.id, `Stake tx reverted (CALL_EXCEPTION) — likely daily/cool-down limit. Stopping.`);
+          break;
         }
-        logger.error(this.id, `Stake attempt ${attempts}: ${err.message.slice(0, 150)}`);
+        logger.error(this.id, `Stake attempt ${attempts}: ${err.message.slice(0, 200)}`);
         this.state.errors++;
         await sleep(2000);
       }
