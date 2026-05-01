@@ -286,8 +286,6 @@ async function main() {
         const session = await bot.api.sync();
         console.log(`  DACC balance: ${session.dacc_balance ?? 'N/A'}`);
         console.log(`  TX count:     ${session.tx_count ?? 'N/A'}`);
-        console.log(`  QE balance:   ${session.qe_balance ?? 'N/A'}`);
-        console.log(`  Streak days:  ${session.streak_days ?? 'N/A'}`);
         results.push({ account: acct.id, success: true, ...session });
 
         // Check faucet status via API (reuse existing bot)
