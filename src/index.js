@@ -283,7 +283,7 @@ async function main() {
         }
 
         // Sync session to get latest balance + tx_count
-        const session = await bot.api.syncSession();
+        const session = await bot.api.sync();
         console.log(`  DACC balance: ${session.dacc_balance ?? 'N/A'}`);
         console.log(`  TX count:     ${session.tx_count ?? 'N/A'}`);
         console.log(`  QE balance:   ${session.qe_balance ?? 'N/A'}`);
@@ -294,13 +294,9 @@ async function main() {
         results.push({ account: acct.id, success: false, error: err.message });
       }
 
-      // Check faucet status via API
+      // Check faucet status via API (reuse existing bot)
       console.log('  Checking recent dispenses...');
       try {
-        const jar = new CookieJar();
-        const bot = new DACBot(acct, jar);
-        await bot.api.fetchCookies();
-        await tryWalletLogin(bot.api, acct);
         const profile = await bot.api.getProfile();
         if (profile.dacc_balance) {
           console.log(`  Profile DACC balance: ${profile.dacc_balance}`);
