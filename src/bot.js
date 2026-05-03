@@ -15,6 +15,28 @@ const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 const randomDelay = (min = 2000, max = 5000) =>
   sleep(Math.floor(Math.random() * (max - min)) + min);
 
+// Exponential backoff for RPC errors: 10s, 20s, 30s ... capped at 60s
+const rpcBackoff = (attempt) => Math.min(10000 * Math.ceil(attempt / 2), 60000);
+
+// Create a fresh provider with timeout on each call (avoid stale connection pools)
+const makeProvider = () => {
+  try {
+    const req = new ethers.FetchRequest(config.RPC_URL);
+    req.timeout = 30000; // 30s timeout per request
+    return new ethers.JsonRpcProvider(req, config.CHAIN_ID_DECIMAL, { staticNetwork: true });
+  } catch {
+    return new ethers.JsonRpcProvider(config.RPC_URL);
+  }
+};
+
+const is504 = (err) => {
+  const m = (err?.message || '').toLowerCase();
+  return m.includes('504') || m.includes('gateway time') ||
+         m.includes('econnreset') || m.includes('etimedout') ||
+         m.includes('econnrefused') || m.includes('fetch failed') ||
+         m.includes('network error') || m.includes('timeout');
+};
+
 // DACC contract on-chain info (from RPC inspection)
 const DACC_CONTRACT = '0x3691a78be270db1f3b1a86177a8f23f89a8cef24';
 const BURN_SELECTOR  = '0x4a5d094b';
@@ -168,10 +190,10 @@ export class DACBot {
     let confirmed = 0;
     let attempts = 0;
 
-    let provider;
+    // Quick RPC availability check (single provider, short test)
     try {
-      provider = new ethers.JsonRpcProvider(config.RPC_URL);
-      await provider.getBlockNumber();
+      const testProvider = makeProvider();
+      await testProvider.getBlockNumber();
     } catch (rpcErr) {
       logger.error(this.id, `RPC unavailable — skipping burn (${rpcErr.message.slice(0, 100)})`);
       this.state.lastBurn = Date.now();
@@ -182,22 +204,32 @@ export class DACBot {
       attempts++;
       try {
         logger.info(this.id, `Burn attempt ${attempts}/${maxAttempts} (${confirmed}/${targetConfirmed} confirmed)...`);
+        // Fresh provider each attempt — avoids stale connection issues
+        const provider = makeProvider();
         const signer = this.account.wallet.connect(provider);
         const balance = await provider.getBalance(this.account.address);
         if (balance < ethers.parseEther(MIN_BALANCE)) {
           logger.warn(this.id, `Burn stopped: low balance ${ethers.formatEther(balance)} ETH`);
           break;
         }
+        const feeData = await provider.getFeeData();
+        const gasPrice = feeData.gasPrice
+          ? (feeData.gasPrice * 2n)
+          : ethers.parseUnits('5', 'gwei');
+
         const tx = await signer.sendTransaction({
           to: DACC_CONTRACT,
           data: BURN_SELECTOR,
           value: ethers.parseEther(TX_VALUE),
+          gasPrice,
+          gasLimit: 100000,
         });
         logger.info(this.id, `Burn tx: ${tx.hash}`);
         const receipt = await tx.wait();
         if (receipt.status === 0) {
-          logger.warn(this.id, `Burn tx reverted — likely daily/cool-down limit. Stopping burn loop.`);
-          break; // revert after 1+ success means limit hit; stop gracefully
+          logger.warn(this.id, `Burn attempt ${attempts}: tx reverted — retrying (daily limit)`);
+          await sleep(3000);
+          continue; // keep trying, don't break
         }
         // Wait for API to index the tx
         await sleep(8000);
@@ -212,7 +244,7 @@ export class DACBot {
           } catch (e) {
             if (retry < 2) {
               logger.info(this.id, `Burn confirm retry ${retry + 1}/3... (${e.message.slice(0, 60)})`);
-              await sleep(2000);
+              await sleep(3000);
             } else {
               logger.error(this.id, `Burn confirm failed: ${e.message.slice(0, 150)}`);
               this.state.errors++;
@@ -225,12 +257,20 @@ export class DACBot {
         await randomDelay(2000, 4000);
       } catch (err) {
         if (err.code === 'CALL_EXCEPTION') {
-          logger.warn(this.id, `Burn tx reverted (CALL_EXCEPTION) — likely daily/cool-down limit. Stopping.`);
-          break;
+          logger.warn(this.id, `Burn attempt ${attempts}: tx reverted — retrying`);
+          await sleep(3000);
+          continue;
         }
-        logger.error(this.id, `Burn attempt ${attempts}: ${err.message.slice(0, 200)}`);
+        // RPC/network error → exponential backoff
+        if (is504(err)) {
+          const backoff = rpcBackoff(attempts);
+          logger.warn(this.id, `Burn attempt ${attempts}: RPC error (${err.message.slice(0, 80)}) — waiting ${backoff / 1000}s...`);
+          await sleep(backoff);
+          continue;
+        }
+        logger.error(this.id, `Burn attempt ${attempts}: ${err.message.slice(0, 150)}`);
         this.state.errors++;
-        await sleep(2000);
+        await sleep(5000);
       }
     }
 
@@ -249,10 +289,9 @@ export class DACBot {
     let confirmed = 0;
     let attempts = 0;
 
-    let provider;
     try {
-      provider = new ethers.JsonRpcProvider(config.RPC_URL);
-      await provider.getBlockNumber();
+      const testProvider = makeProvider();
+      await testProvider.getBlockNumber();
     } catch (rpcErr) {
       logger.error(this.id, `RPC unavailable — skipping stake (${rpcErr.message.slice(0, 100)})`);
       this.state.lastStake = Date.now();
@@ -263,22 +302,32 @@ export class DACBot {
       attempts++;
       try {
         logger.info(this.id, `Stake attempt ${attempts}/${maxAttempts} (${confirmed}/${targetConfirmed} confirmed)...`);
+        // Fresh provider each attempt
+        const provider = makeProvider();
         const signer = this.account.wallet.connect(provider);
         const balance = await provider.getBalance(this.account.address);
         if (balance < ethers.parseEther(MIN_BALANCE)) {
           logger.warn(this.id, `Stake stopped: low balance ${ethers.formatEther(balance)} ETH`);
           break;
         }
+        const feeData = await provider.getFeeData();
+        const gasPrice = feeData.gasPrice
+          ? (feeData.gasPrice * 2n)
+          : ethers.parseUnits('5', 'gwei');
+
         const tx = await signer.sendTransaction({
           to: DACC_CONTRACT,
           data: STAKE_SELECTOR,
           value: ethers.parseEther(TX_VALUE),
+          gasPrice,
+          gasLimit: 100000,
         });
         logger.info(this.id, `Stake tx: ${tx.hash}`);
         const receipt = await tx.wait();
         if (receipt.status === 0) {
-          logger.warn(this.id, `Stake tx reverted — likely daily/cool-down limit. Stopping stake loop.`);
-          break; // revert after 1+ success means limit hit; stop gracefully
+          logger.warn(this.id, `Stake attempt ${attempts}: tx reverted — retrying (cooldown/daily limit)`);
+          await sleep(3000);
+          continue; // keep trying, don't break
         }
         // Wait for API to index the tx
         await sleep(8000);
@@ -293,7 +342,7 @@ export class DACBot {
           } catch (e) {
             if (retry < 2) {
               logger.info(this.id, `Stake confirm retry ${retry + 1}/3... (${e.message.slice(0, 60)})`);
-              await sleep(2000);
+              await sleep(5000);
             } else {
               logger.error(this.id, `Stake confirm failed: ${e.message.slice(0, 150)}`);
               this.state.errors++;
@@ -306,12 +355,20 @@ export class DACBot {
         await randomDelay(2000, 4000);
       } catch (err) {
         if (err.code === 'CALL_EXCEPTION') {
-          logger.warn(this.id, `Stake tx reverted (CALL_EXCEPTION) — likely daily/cool-down limit. Stopping.`);
-          break;
+          logger.warn(this.id, `Stake attempt ${attempts}: tx reverted — retrying`);
+          await sleep(3000);
+          continue;
         }
-        logger.error(this.id, `Stake attempt ${attempts}: ${err.message.slice(0, 200)}`);
+        // RPC/network error → exponential backoff
+        if (is504(err)) {
+          const backoff = rpcBackoff(attempts);
+          logger.warn(this.id, `Stake attempt ${attempts}: RPC error (${err.message.slice(0, 80)}) — waiting ${backoff / 1000}s...`);
+          await sleep(backoff);
+          continue;
+        }
+        logger.error(this.id, `Stake attempt ${attempts}: ${err.message.slice(0, 150)}`);
         this.state.errors++;
-        await sleep(2000);
+        await sleep(5000);
       }
     }
 
