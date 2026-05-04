@@ -4,40 +4,29 @@ import { CookieJar, InceptionAPI } from './api.js';
 import config from './config.js';
 
 const logger = {
-  info: (acctId, msg) => console.log(`[${new Date().toISOString()}] [Account ${acctId}] ${msg}`),
-  error: (acctId, msg) => console.error(`[${new Date().toISOString()}] [Account ${acctId}] ERROR: ${msg}`),
-  success: (acctId, msg) => console.log(`[${new Date().toISOString()}] [Account ${acctId}] ✅ ${msg}`),
-  warn: (acctId, msg) => console.warn(`[${new Date().toISOString()}] [Account ${acctId}] ⚠️ ${msg}`),
+  info:    (id, msg) => console.log( `[${new Date().toISOString()}] [Account ${id}] ${msg}`),
+  error:   (id, msg) => console.error(`[${new Date().toISOString()}] [Account ${id}] ERROR: ${msg}`),
+  success: (id, msg) => console.log( `[${new Date().toISOString()}] [Account ${id}] ✅ ${msg}`),
+  warn:    (id, msg) => console.warn( `[${new Date().toISOString()}] [Account ${id}] ⚠️ ${msg}`),
 };
 
-// Delay helper
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 const randomDelay = (min = 2000, max = 5000) =>
   sleep(Math.floor(Math.random() * (max - min)) + min);
 
-// Exponential backoff for RPC errors: 10s, 20s, 30s ... capped at 60s
-const rpcBackoff = (attempt) => Math.min(10000 * Math.ceil(attempt / 2), 60000);
-
-// Create a fresh provider with timeout on each call (avoid stale connection pools)
-const makeProvider = () => {
-  try {
-    const req = new ethers.FetchRequest(config.RPC_URL);
-    req.timeout = 30000; // 30s timeout per request
-    return new ethers.JsonRpcProvider(req, config.CHAIN_ID_DECIMAL, { staticNetwork: true });
-  } catch {
-    return new ethers.JsonRpcProvider(config.RPC_URL);
+const pollReceipt = async (rpcUrl, hash, timeoutMs = 180000, intervalMs = 8000) => {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      const provider = new ethers.JsonRpcProvider(rpcUrl);
+      const receipt  = await provider.getTransactionReceipt(hash);
+      if (receipt) return receipt;
+    } catch (_) { /* 504 / timeout — diam-diam retry */ }
+    await sleep(intervalMs);
   }
+  return null; // timeout tapi tx mungkin sudah on-chain
 };
 
-const is504 = (err) => {
-  const m = (err?.message || '').toLowerCase();
-  return m.includes('504') || m.includes('gateway time') ||
-         m.includes('econnreset') || m.includes('etimedout') ||
-         m.includes('econnrefused') || m.includes('fetch failed') ||
-         m.includes('network error') || m.includes('timeout');
-};
-
-// DACC contract on-chain info (from RPC inspection)
 const DACC_CONTRACT = '0x3691a78be270db1f3b1a86177a8f23f89a8cef24';
 const BURN_SELECTOR  = '0x4a5d094b';
 const STAKE_SELECTOR = '0x3a4b66f1';
@@ -47,348 +36,152 @@ const MIN_BALANCE    = '0.12';
 export class DACBot {
   constructor(account, cookieJar) {
     this.account = account;
-    this.api = new InceptionAPI(cookieJar);
-    this.id = account.id;
-    // State tracking
-    this.state = {
-      lastFaucet: null,
-      lastCrate: null,
-      lastBurn: null,
-      lastStake: null,
-      runs: 0,
-      errors: 0,
-    };
+    this.api     = new InceptionAPI(cookieJar);
+    this.id      = account.id;
+    this.state   = { lastFaucet: null, lastCrate: null, lastBurn: null, lastStake: null, runs: 0, errors: 0 };
   }
 
-  // Run full cycle: faucet → open crates → burn → stake
   async runCycle(opts = {}) {
-    const {
-      doFaucet = true,
-      crateCount = config.DEFAULT_CRATE_COUNT,
-      doBurn = false,
-      doStake = false,
-      burnAmount = '0',
-      stakeAmount = '0',
-    } = opts;
-
+    const { doFaucet = true, crateCount = config.DEFAULT_CRATE_COUNT,
+            doBurn = false, doStake = false } = opts;
     this.state.runs++;
     logger.info(this.id, `Starting cycle #${this.state.runs}`);
-
-    // 1. Sync session
-    await this.syncSession();
-    await randomDelay();
-
-    // 2. Faucet
-    if (doFaucet) {
-      await this.doFaucet();
-      await randomDelay();
-    }
-
-    // Re-sync after faucet to pick up faucet credits
-    if (doFaucet) {
-      await sleep(5000);
-      await this.syncSession();
-      await randomDelay();
-    }
-
-    // 3. Open Quantum Crates
-    await this.doOpenCrates(crateCount);
-    await randomDelay();
-
-    // 4. Burn DACC → QE (if enabled)
-    if (doBurn) {
-      await this.doBurn(burnAmount);
-      await randomDelay();
-    }
-
-    // 5. Stake (if enabled)
-    if (doStake) {
-      await this.doStake(stakeAmount);
-      await randomDelay();
-    }
-
-    // 6. Report
+    await this.syncSession(); await randomDelay();
+    if (doFaucet) { await this.doFaucet(); await randomDelay(); await sleep(5000); await this.syncSession(); await randomDelay(); }
+    await this.doOpenCrates(crateCount); await randomDelay();
+    if (doBurn)  { await this.doBurn();  await randomDelay(); }
+    if (doStake) { await this.doStake(); await randomDelay(); }
     await this.reportStatus();
-
     logger.success(this.id, `Cycle #${this.state.runs} complete`);
   }
 
   async syncSession() {
     try {
       logger.info(this.id, 'Syncing session...');
-      const result = await this.api.sync();
-      logger.info(this.id, `Session synced: ${JSON.stringify(result).slice(0, 100)}`);
-      return result;
-    } catch (err) {
-      logger.warn(this.id, `Sync failed: ${err.message}`);
-      return null;
-    }
+      const r = await this.api.sync();
+      logger.info(this.id, `Session synced: ${JSON.stringify(r).slice(0, 100)}`);
+      return r;
+    } catch (err) { logger.warn(this.id, `Sync failed: ${err.message}`); return null; }
   }
 
   async doFaucet() {
     try {
       logger.info(this.id, `Requesting faucet for ${this.account.address}...`);
-
-      // Probe status (informational only — don't gate on it; many server shapes)
-      let status = null;
+      try { const s = await this.api.faucetStatus(this.account.address); logger.info(this.id, `Faucet status: ${JSON.stringify(s).slice(0, 200)}`); } catch {}
       try {
-        status = await this.api.faucetStatus(this.account.address);
-        logger.info(this.id, `Faucet status: ${JSON.stringify(status).slice(0, 200)}`);
-      } catch (e) {
-        logger.info(this.id, `Faucet status probe failed (continuing): ${e.message.slice(0, 100)}`);
-      }
-
-      // Always attempt the claim; server is source of truth for cooldown
-      try {
-        const result = await this.api.faucet(this.account.address);
-        logger.success(this.id, `Faucet claimed: ${JSON.stringify(result).slice(0, 200)}`);
-        this.state.lastFaucet = Date.now();
-        return result;
+        const r = await this.api.faucet(this.account.address);
+        logger.success(this.id, `Faucet claimed: ${JSON.stringify(r).slice(0, 200)}`);
+        this.state.lastFaucet = Date.now(); return r;
       } catch (err) {
         const m = err.message.toLowerCase();
-        if (m.includes('already') || m.includes('cooldown') || m.includes('wait') ||
-            m.includes('too soon') || m.includes('claimed') || m.includes('429')) {
-          logger.info(this.id, `Faucet on cooldown — skipping (${err.message.slice(0, 120)})`);
-          return null;
+        if (m.includes('already') || m.includes('cooldown') || m.includes('wait') || m.includes('claimed') || m.includes('429')) {
+          logger.info(this.id, `Faucet on cooldown — skipping (${err.message.slice(0, 120)})`); return null;
         }
         throw err;
       }
-    } catch (err) {
-      logger.error(this.id, `Faucet failed: ${err.message.slice(0, 200)}`);
-      this.state.errors++;
-      return null;
-    }
+    } catch (err) { logger.error(this.id, `Faucet failed: ${err.message.slice(0, 200)}`); this.state.errors++; return null; }
   }
 
   async doOpenCrates(count = config.DEFAULT_CRATE_COUNT) {
-    let claimed = 0;
     for (let i = 0; i < count; i++) {
       try {
-        logger.info(this.id, `Opening crate ${i + 1}/${count}...`);
-        const result = await this.api.openCrate(1);
-        const reward = result?.reward?.label || JSON.stringify(result).slice(0, 80);
-        logger.success(this.id, `Crate ${i + 1}: ${reward}`);
-        claimed++;
+        logger.info(this.id, `Opening crate ${i+1}/${count}...`);
+        const r = await this.api.openCrate(1);
+        logger.success(this.id, `Crate ${i+1}: ${r?.reward?.label || JSON.stringify(r).slice(0, 80)}`);
         await randomDelay(1000, 3000);
       } catch (err) {
         const m = err.message.toLowerCase();
         if (m.includes('daily limit') || m.includes('maximum') || m.includes('already')) {
-          logger.info(this.id, `Open crate ${i + 1}: daily limit reached — stopping crate opens`);
-          break;
+          logger.info(this.id, `Open crate ${i+1}: daily limit reached — stopping`); break;
         }
-        logger.error(this.id, `Open crate ${i + 1} failed: ${err.message.slice(0, 120)}`);
-        this.state.errors++;
+        logger.error(this.id, `Open crate ${i+1} failed: ${err.message.slice(0, 120)}`); this.state.errors++;
       }
     }
     this.state.lastCrate = Date.now();
-    return { claimed, total: count };
   }
 
-  async doBurn(amount = '0') {
-    const targetConfirmed = 3;
-    const maxAttempts = 20;
-    let confirmed = 0;
-    let attempts = 0;
-
-    // Quick RPC availability check (single provider, short test)
-    try {
-      const testProvider = makeProvider();
-      await testProvider.getBlockNumber();
-    } catch (rpcErr) {
-      logger.error(this.id, `RPC unavailable — skipping burn (${rpcErr.message.slice(0, 100)})`);
-      this.state.lastBurn = Date.now();
-      return { confirmed, target: targetConfirmed, attempts: 0, rpcDown: true };
-    }
+  async _sendOnChain(selector, label) {
+    const targetConfirmed = label === 'Burn' ? 3 : 5;
+    const maxAttempts     = 20;
+    let confirmed = 0, attempts = 0;
 
     while (confirmed < targetConfirmed && attempts < maxAttempts) {
       attempts++;
+      logger.info(this.id, `${label} attempt ${attempts}/${maxAttempts} (${confirmed}/${targetConfirmed} confirmed)...`);
       try {
-        logger.info(this.id, `Burn attempt ${attempts}/${maxAttempts} (${confirmed}/${targetConfirmed} confirmed)...`);
-        // Fresh provider each attempt — avoids stale connection issues
-        const provider = makeProvider();
-        const signer = this.account.wallet.connect(provider);
+        // Fresh provider per attempt
+        const provider = new ethers.JsonRpcProvider(config.RPC_URL);
+        
+        // RPC check awal
+        await provider.getBlockNumber();
+
+        const signer  = this.account.wallet.connect(provider);
         const balance = await provider.getBalance(this.account.address);
         if (balance < ethers.parseEther(MIN_BALANCE)) {
-          logger.warn(this.id, `Burn stopped: low balance ${ethers.formatEther(balance)} ETH`);
-          break;
+          logger.warn(this.id, `${label} stopped: low balance ${ethers.formatEther(balance)} DACC`); break;
         }
-        const feeData = await provider.getFeeData();
-        const gasPrice = feeData.gasPrice
-          ? (feeData.gasPrice * 2n)
-          : ethers.parseUnits('5', 'gwei');
+
+        // Gas 2× supaya tx cepat masuk
+        const feeData  = await provider.getFeeData();
+        const gasPrice = feeData.gasPrice ? feeData.gasPrice * 2n : ethers.parseUnits('5', 'gwei');
 
         const tx = await signer.sendTransaction({
-          to: DACC_CONTRACT,
-          data: BURN_SELECTOR,
+          to: DACC_CONTRACT, data: selector,
           value: ethers.parseEther(TX_VALUE),
-          gasPrice,
-          gasLimit: 100000,
+          gasPrice, gasLimit: 100000,
         });
-        logger.info(this.id, `Burn tx: ${tx.hash}`);
-        const receipt = await tx.wait();
-        if (receipt.status === 0) {
-          logger.warn(this.id, `Burn attempt ${attempts}: tx reverted — retrying (daily limit)`);
-          await sleep(3000);
-          continue; // keep trying, don't break
+        logger.info(this.id, `${label} tx: ${tx.hash}`);
+
+        // Poll receipt sendiri
+        const receipt = await pollReceipt(config.RPC_URL, tx.hash);
+        if (!receipt) {
+          logger.warn(this.id, `${label} receipt timeout — tx mungkin on-chain, coba confirm API...`);
+        } else if (receipt.status === 0) {
+          logger.warn(this.id, `${label} attempt ${attempts}: tx reverted — retrying`);
+          await sleep(3000); continue;
         }
-        // Wait for API to index the tx
-        await sleep(8000);
+
+        await sleep(8000); 
+
         let confirmOk = false;
         for (let retry = 0; retry < 3; retry++) {
           try {
-            const result = await this.api.confirmBurn({ tx_hash: tx.hash });
+            const result = label === 'Burn'
+              ? await this.api.confirmBurn({ tx_hash: tx.hash })
+              : await this.api.confirmStake({ tx_hash: tx.hash });
             confirmed++;
-            logger.success(this.id, `Burn ${confirmed}/${targetConfirmed} confirmed: ${JSON.stringify(result).slice(0, 100)}`);
-            confirmOk = true;
-            break;
+            logger.success(this.id, `${label} ${confirmed}/${targetConfirmed} confirmed: ${JSON.stringify(result).slice(0, 100)}`);
+            confirmOk = true; break;
           } catch (e) {
-            if (retry < 2) {
-              logger.info(this.id, `Burn confirm retry ${retry + 1}/3... (${e.message.slice(0, 60)})`);
-              await sleep(3000);
-            } else {
-              logger.error(this.id, `Burn confirm failed: ${e.message.slice(0, 150)}`);
-              this.state.errors++;
-            }
+            if (retry < 2) { logger.info(this.id, `${label} confirm retry ${retry+1}/3... (${e.message.slice(0, 60)})`); await sleep(3000); }
+            else { logger.error(this.id, `${label} confirm failed: ${e.message.slice(0, 150)}`); this.state.errors++; }
           }
         }
-        if (!confirmOk) {
-          logger.warn(this.id, `Burn tx on-chain but API confirm failed — does not count toward target`);
-        }
+        if (!confirmOk) logger.warn(this.id, `${label} tx on-chain tapi API confirm gagal`);
         await randomDelay(2000, 4000);
+
       } catch (err) {
-        if (err.code === 'CALL_EXCEPTION') {
-          logger.warn(this.id, `Burn attempt ${attempts}: tx reverted — retrying`);
-          await sleep(3000);
-          continue;
-        }
-        // RPC/network error → exponential backoff
-        if (is504(err)) {
-          const backoff = rpcBackoff(attempts);
-          logger.warn(this.id, `Burn attempt ${attempts}: RPC error (${err.message.slice(0, 80)}) — waiting ${backoff / 1000}s...`);
-          await sleep(backoff);
-          continue;
-        }
-        logger.error(this.id, `Burn attempt ${attempts}: ${err.message.slice(0, 150)}`);
+        logger.error(this.id, `${label} attempt ${attempts} error: ${err.message.slice(0, 150)}`);
         this.state.errors++;
-        await sleep(5000);
+        
+        // Exponential backoff logic
+        const backoffMs = Math.min(10000 * attempts, 60000);
+        logger.warn(this.id, `RPC overload — waiting ${backoffMs / 1000}s before next attempt...`);
+        await sleep(backoffMs);
       }
     }
 
-    if (confirmed >= targetConfirmed) {
-      logger.success(this.id, `Burn target reached: ${confirmed}/${targetConfirmed} confirmed`);
-    } else {
-      logger.warn(this.id, `Burn session ended: ${confirmed}/${targetConfirmed} confirmed (${attempts} attempts, max ${maxAttempts})`);
-    }
-    this.state.lastBurn = Date.now();
-    return { confirmed, target: targetConfirmed, attempts };
+    if (confirmed >= targetConfirmed) logger.success(this.id, `${label} target reached: ${confirmed}/${targetConfirmed}`);
+    else logger.warn(this.id, `${label} ended: ${confirmed}/${targetConfirmed} (${attempts} attempts)`);
+    if (label === 'Burn') this.state.lastBurn = Date.now();
+    else this.state.lastStake = Date.now();
   }
 
-  async doStake(amount = '0') {
-    const targetConfirmed = 5;
-    const maxAttempts = 20;
-    let confirmed = 0;
-    let attempts = 0;
-
-    try {
-      const testProvider = makeProvider();
-      await testProvider.getBlockNumber();
-    } catch (rpcErr) {
-      logger.error(this.id, `RPC unavailable — skipping stake (${rpcErr.message.slice(0, 100)})`);
-      this.state.lastStake = Date.now();
-      return { confirmed, target: targetConfirmed, attempts: 0, rpcDown: true };
-    }
-
-    while (confirmed < targetConfirmed && attempts < maxAttempts) {
-      attempts++;
-      try {
-        logger.info(this.id, `Stake attempt ${attempts}/${maxAttempts} (${confirmed}/${targetConfirmed} confirmed)...`);
-        // Fresh provider each attempt
-        const provider = makeProvider();
-        const signer = this.account.wallet.connect(provider);
-        const balance = await provider.getBalance(this.account.address);
-        if (balance < ethers.parseEther(MIN_BALANCE)) {
-          logger.warn(this.id, `Stake stopped: low balance ${ethers.formatEther(balance)} ETH`);
-          break;
-        }
-        const feeData = await provider.getFeeData();
-        const gasPrice = feeData.gasPrice
-          ? (feeData.gasPrice * 2n)
-          : ethers.parseUnits('5', 'gwei');
-
-        const tx = await signer.sendTransaction({
-          to: DACC_CONTRACT,
-          data: STAKE_SELECTOR,
-          value: ethers.parseEther(TX_VALUE),
-          gasPrice,
-          gasLimit: 100000,
-        });
-        logger.info(this.id, `Stake tx: ${tx.hash}`);
-        const receipt = await tx.wait();
-        if (receipt.status === 0) {
-          logger.warn(this.id, `Stake attempt ${attempts}: tx reverted — retrying (cooldown/daily limit)`);
-          await sleep(3000);
-          continue; // keep trying, don't break
-        }
-        // Wait for API to index the tx
-        await sleep(8000);
-        let confirmOk = false;
-        for (let retry = 0; retry < 3; retry++) {
-          try {
-            const result = await this.api.confirmStake({ tx_hash: tx.hash });
-            confirmed++;
-            logger.success(this.id, `Stake ${confirmed}/${targetConfirmed} confirmed: ${JSON.stringify(result).slice(0, 100)}`);
-            confirmOk = true;
-            break;
-          } catch (e) {
-            if (retry < 2) {
-              logger.info(this.id, `Stake confirm retry ${retry + 1}/3... (${e.message.slice(0, 60)})`);
-              await sleep(5000);
-            } else {
-              logger.error(this.id, `Stake confirm failed: ${e.message.slice(0, 150)}`);
-              this.state.errors++;
-            }
-          }
-        }
-        if (!confirmOk) {
-          logger.warn(this.id, `Stake tx on-chain but API confirm failed — does not count toward target`);
-        }
-        await randomDelay(2000, 4000);
-      } catch (err) {
-        if (err.code === 'CALL_EXCEPTION') {
-          logger.warn(this.id, `Stake attempt ${attempts}: tx reverted — retrying`);
-          await sleep(3000);
-          continue;
-        }
-        // RPC/network error → exponential backoff
-        if (is504(err)) {
-          const backoff = rpcBackoff(attempts);
-          logger.warn(this.id, `Stake attempt ${attempts}: RPC error (${err.message.slice(0, 80)}) — waiting ${backoff / 1000}s...`);
-          await sleep(backoff);
-          continue;
-        }
-        logger.error(this.id, `Stake attempt ${attempts}: ${err.message.slice(0, 150)}`);
-        this.state.errors++;
-        await sleep(5000);
-      }
-    }
-
-    if (confirmed >= targetConfirmed) {
-      logger.success(this.id, `Stake target reached: ${confirmed}/${targetConfirmed} confirmed`);
-    } else {
-      logger.warn(this.id, `Stake session ended: ${confirmed}/${targetConfirmed} confirmed (${attempts} attempts, max ${maxAttempts})`);
-    }
-    this.state.lastStake = Date.now();
-    return { confirmed, target: targetConfirmed, attempts };
-  }
+  async doBurn()  { return this._sendOnChain(BURN_SELECTOR,  'Burn');  }
+  async doStake() { return this._sendOnChain(STAKE_SELECTOR, 'Stake'); }
 
   async reportStatus() {
-    try {
-      const profile = await this.api.getProfile();
-      logger.info(this.id, `Profile: ${JSON.stringify(profile).slice(0, 300)}`);
-      return profile;
-    } catch (err) {
-      logger.warn(this.id, `Profile fetch failed: ${err.message}`);
-      return null;
-    }
+    try { const p = await this.api.getProfile(); logger.info(this.id, `Profile: ${JSON.stringify(p).slice(0, 300)}`); }
+    catch (err) { logger.warn(this.id, `Profile fetch failed: ${err.message}`); }
   }
 }
